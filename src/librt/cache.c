@@ -154,6 +154,31 @@ cache_warn(const struct rt_cache *cache, const char *path, const char *msg)
 }
 
 
+/**
+ * Check directory permissions and return Unix-style permission bits.
+ *
+ * Returns permission bits: 4=readable, 2=writable, 1=executable, 0=none/error
+ * Combines bits for available permissions (e.g., 7 = read+write+execute)
+ */
+static int
+cache_check_dir_perms(const char *path)
+{
+    int perms = 0;
+    
+    if (!bu_file_exists(path, NULL))
+	return 0;
+    
+    if (bu_file_readable(path))
+	perms |= 4;
+    if (bu_file_writable(path))
+	perms |= 2;
+    if (bu_file_executable(path))
+	perms |= 1;
+    
+    return perms;
+}
+
+
 static int
 cache_format(const struct rt_cache *cache)
 {
@@ -266,9 +291,12 @@ cache_init(struct rt_cache *cache)
 	cache_warn(cache, dir, "Location must be readable.  Caching disabled.");
 	return 0;
     }
-    if (!cache->read_only && !bu_file_writable(dir)) {
-	cache_warn(cache, dir, "Location is READ-ONLY.");
-	cache->read_only = 1;
+    if (!cache->read_only) {
+	int perms = cache_check_dir_perms(dir);
+	if ((perms & 3) != 3) {  /* need write(2) + execute(1) */
+	    cache_warn(cache, dir, "Location is READ-ONLY.");
+	    cache->read_only = 1;
+	}
     }
 
     /* make sure there's a cache/dir/format file */
@@ -302,9 +330,12 @@ cache_init(struct rt_cache *cache)
 	cache_warn(cache, path, "Directory blocking format file creation.  Caching disabled.");
 	return 0;
     }
-    if (!cache->read_only && !bu_file_writable(path)) {
-	cache_warn(cache, path, "Location is READ-ONLY.");
-	cache->read_only = 1;
+    if (!cache->read_only) {
+	int perms = cache_check_dir_perms(path);
+	if (!(perms & 2)) {  /* need write(2) */
+	    cache_warn(cache, path, "Location is READ-ONLY.");
+	    cache->read_only = 1;
+	}
     }
 
     /* v1+ cache is a directory of directories of .g files using
@@ -327,9 +358,12 @@ cache_init(struct rt_cache *cache)
 	cache_warn(cache, path, "Cannot initialize objects directory.  Caching disabled.");
 	return 0;
     }
-    if (!cache->read_only && !bu_file_writable(path)) {
-	cache_warn(cache, path, "Location is READ-ONLY.");
-	cache->read_only = 1;
+    if (!cache->read_only) {
+	int perms = cache_check_dir_perms(path);
+	if ((perms & 3) != 3) {  /* need write(2) + execute(1) */
+	    cache_warn(cache, path, "Location is READ-ONLY.");
+	    cache->read_only = 1;
+	}
     }
 
     /* initialize database instance pointer storage */
@@ -587,14 +621,42 @@ cache_try_store(struct rt_cache *cache, const char *name, const struct rt_db_int
 	bu_avs_free(&attributes);
     }
 
+    /* verify cache directory permissions at time of write (may have changed at runtime) */
+    {
+	int perms = cache_check_dir_perms(cache->dir);
+	if ((perms & 3) != 3) {  /* need write(2) + execute(1) */
+	    if (perms == 0) {
+		cache_warn(cache, cache->dir, "Directory does not exist or has no permissions.  Caching disabled.");
+	    } else if (!(perms & 2)) {
+		cache_warn(cache, cache->dir, "Directory is not writable.  Caching disabled.");
+	    } else if (!(perms & 1)) {
+		cache_warn(cache, cache->dir, "Directory is not executable.  Caching disabled.");
+	    }
+	    cache->read_only = 1;  /* update flag based on runtime permissions */
+	    bu_free_external(&attributes_external);
+	    bu_free_external(&data_external);
+	    return 0;
+	} else {
+	    /* permissions are good - update flag if it was previously read-only */
+	    cache->read_only = 0;
+	}
+    }
+
     cache_get_objdir(cache, name, tmppath, MAXPATHLEN);
-    if (bu_file_exists(tmppath, NULL) && (!bu_file_writable(tmppath) || !bu_file_executable(tmppath))) {
-	char objdir[MAXPATHLEN] = {0};
-	bu_path_basename(tmppath, objdir);
-	cache_warn(cache, objdir, "Subdirectory is not writable.  Caching disabled.");
-	bu_free_external(&attributes_external);
-	bu_free_external(&data_external);
-	return 0;
+    if (bu_file_exists(tmppath, NULL)) {
+	int perms = cache_check_dir_perms(tmppath);
+        if ((perms & 3) != 3) {  /* need write(2) + execute(1) */
+            char objdir[MAXPATHLEN] = {0};
+            bu_path_basename(tmppath, objdir);
+            if (!(perms & 2)) {
+            cache_warn(cache, objdir, "Subdirectory is not writable.  Caching disabled.");
+            } else if (!(perms & 1)) {
+            cache_warn(cache, objdir, "Subdirectory is not executable.  Caching disabled.");
+            }
+            bu_free_external(&attributes_external);
+            bu_free_external(&data_external);
+            return 0;
+        }
     }
 
     /* get a temporary name unlikely to exist */
